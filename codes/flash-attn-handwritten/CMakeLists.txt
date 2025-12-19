@@ -15,7 +15,11 @@ add_library(flash_attn STATIC
     src/flash_attn_dispatch.cpp
     src/cpu/flash_attn_v2_cpu.cpp
     src/cuda/flash_attn_v2_cuda.cu
-    src/baseline/flash_attn_v2_baseline.cu   # <-- 新增
+    src/baseline/flash_attn_v2_baseline.cu
+    src/ampere/flash_attn_v2_ampere_wmma.cu
+    # src/ampere/flash_attn_v2_ampere_mma.cu
+    # src/hopper/flash_attn_v2_hopper_wgmma.cu
+    # src/blackwell/flash_attn_v2_blackwell_tcgen05.cu
 )
 target_include_directories(flash_attn
     PRIVATE
