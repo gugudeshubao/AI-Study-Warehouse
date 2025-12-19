@@ -27,3 +27,16 @@ void flash_attn_v2_fwd(const float *q, const float *k, const float *v,
 void flash_attn_v3_fwd(...);
 void flash_attn_v4_fwd(...);
 */
+
+
+// 反向接口：dout 是前向输出梯度，返回 {dQ,dK,dV}
+struct FlashAttnGrad {
+    float* dQ;
+    float* dK;
+    float* dV;
+};
+
+FlashAttnGrad flash_attn_v2_backward(const float* q, const float* k, const float* v,
+                                     const float* out, const float* dout,
+                                     int B, int H, int N, int D,
+                                     Arch arch);

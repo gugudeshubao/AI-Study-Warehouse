@@ -122,3 +122,260 @@ void flash_attn_v2_blackwell_tcgen05_fwd(const fp8_t* q, const fp8_t* k, const f
             N, D);
     cudaDeviceSynchronize();
 }
+
+
+extern "C" __global__ void flash_v2_blackwell_tcgen05_backward_kernel(
+    const fp8_t* __restrict__ q,
+    const fp8_t* __restrict__ k,
+    const fp8_t* __restrict__ v,
+    const float* __restrict__ out,
+    const float* __restrict__ dout,
+    float* __restrict__ dQ,
+    float* __restrict__ dK,
+    float* __restrict__ dV,
+    int N, int D)
+{
+    // TMEM 双缓冲
+    extern __shared__ char tmem[];
+    float* tmem_o  = reinterpret_cast<float*>(tmem);                      // 累加器
+    fp8_t* tmem_kv = reinterpret_cast<fp8_t*>(tmem_o + M_TILE * N_TILE); // Q/K/V
+
+    int tid   = threadIdx.x;
+    int tileM = blockIdx.y * M_TILE;
+    int tileN = blockIdx.z * N_TILE;
+
+    float accum[8][4] = {};   // 256×128 输出，128 thread 覆盖
+
+    // ===== 阶段 1：前向 S = Q@K^T =====
+    for (int k0 = 0; k0 < D; k0 += K_TILE) {
+        if (tid == 0) {
+            __cudaptx_tma_load_bulk_tensor(tmem_kv, q_tma_map, tileM, k0,
+                                           M_TILE * K_TILE * sizeof(fp8_t));
+        }
+        if (tid == 1) {
+            __cudaptx_tma_load_bulk_tensor(tmem_kv + M_TILE * K_TILE, k_tma_map, tileN, k0,
+                                           N_TILE * K_TILE * sizeof(fp8_t));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        asm volatile("tcgen05.mma.sp.sync.aligned.m256n128k32.row.col.f32.fp8.fp8.fp32 "
+                     "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+                     "[%8], [%9], [%10], "
+                     "{%11,%12,%13,%14,%15,%16,%17,%18};\n"
+                     : "+f"(accum[0][0]), "+f"(accum[0][1]), "+f"(accum[0][2]), "+f"(accum[0][3]),
+                       "+f"(accum[1][0]), "+f"(accum[1][1]), "+f"(accum[1][2]), "+f"(accum[1][3])
+                     : "l"(tmem_kv),                                    // Q
+                       "l"(tmem_kv + M_TILE * K_TILE),                  // K
+                       "l"(nullptr),                                    // 稠密
+                       "f"(accum[0][0]), "f"(accum[0][1]), "f"(accum[0][2]), "f"(accum[0][3]),
+                       "f"(accum[1][0]), "f"(accum[1][1]), "f"(accum[1][2]), "f"(accum[1][3]));
+    }
+    // store S
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 4; ++j) {
+            int gRow = tileM + (tid / 16) * 8 + i;
+            int gCol = tileN + (tid & 15) * 4 + j;
+            if (gRow < N && gCol < N)
+                tmem_o[gRow * N_TILE + gCol] = accum[i][j];
+        }
+    __syncthreads();
+
+    // ===== 阶段 2：P = softmax(S) =====
+    __shared__ float smem_max[M_TILE], smem_sum[M_TILE];
+    for (int row = tid; row < M_TILE; row += blockDim.x) {
+        float maxVal = -1e38f;
+        for (int col = 0; col < N_TILE; col += 4) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+                maxVal = fmaxf(maxVal, accum[row/16][c]);
+        }
+        smem_max[row] = maxVal;
+        __syncthreads();
+        float sum = 0.0f;
+        for (int col = 0; col < N_TILE; col += 4) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                float ev = expf(accum[row/16][c] - maxVal);
+                tmem_o[gRow * N_TILE + gCol] = ev;
+                sum += ev;
+            }
+        }
+        smem_sum[row] = sum;
+        __syncthreads();
+        for (int col = 0; col < N_TILE; col += 4) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+                tmem_o[gRow * N_TILE + gCol] /= sum;
+        }
+    }
+
+    // ===== 阶段 3：dV = P^T @ dout =====
+    for (int k0 = 0; k0 < D; k0 += K_TILE) {
+        if (tid == 0) {
+            __cudaptx_tma_load_bulk_tensor(tmem_kv + 2 * M_TILE * K_TILE, v_tma_map, tileN, k0,
+                                           N_TILE * K_TILE * sizeof(fp8_t));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        asm volatile("tcgen05.mma.sp.sync.aligned.m256n128k32.row.col.f32.fp8.fp8.fp32 "
+                     "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+                     "[%8], [%9], [%10], "
+                     "{%11,%12,%13,%14,%15,%16,%17,%18};\n"
+                     : "+f"(accum[0][0]), "+f"(accum[0][1]), "+f"(accum[0][2]), "+f"(accum[0][3]),
+                       "+f"(accum[1][0]), "+f"(accum[1][1]), "+f"(accum[1][2]), "+f"(accum[1][3])
+                     : "l"(tmem_o),                                    // P^T
+                       "l"(tmem_kv + 2 * M_TILE * K_TILE),             // V
+                       "l"(nullptr),
+                       "f"(accum[0][0]), "f"(accum[0][1]), "f"(accum[0][2]), "f"(accum[0][3]),
+                       "f"(accum[1][0]), "f"(accum[1][1]), "f"(accum[1][2]), "f"(accum[1][3]));
+    }
+    // store dV
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 4; ++j) {
+            int gRow = tileN + (tid / 16) * 8 + i;
+            int gCol = tileM + (tid & 15) * 4 + j;
+            if (gRow < N && gCol < D)
+                dV[gRow * D + gCol] = accum[i][j];
+        }
+    __syncthreads();
+
+    // ===== 阶段 4：grad_S = dout @ V^T =====
+    for (int k0 = 0; k0 < D; k0 += K_TILE) {
+        if (tid == 0) {
+            __cudaptx_tma_load_bulk_tensor(tmem_kv + 2 * M_TILE * K_TILE, v_tma_map, tileN, k0,
+                                           N_TILE * K_TILE * sizeof(fp8_t));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        asm volatile("tcgen05.mma.sp.sync.aligned.m256n128k32.row.col.f32.fp8.fp8.fp32 "
+                     "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+                     "[%8], [%9], [%10], "
+                     "{%11,%12,%13,%14,%15,%16,%17,%18};\n"
+                     : "+f"(accum[0][0]), "+f"(accum[0][1]), "+f"(accum[0][2]), "+f"(accum[0][3]),
+                       "+f"(accum[1][0]), "+f"(accum[1][1]), "+f"(accum[1][2]), "+f"(accum[1][3])
+                     : "l"(tmem_dout),                                 // dout
+                       "l"(tmem_kv + 2 * M_TILE * K_TILE),             // V^T
+                       "l"(nullptr),
+                       "f"(accum[0][0]), "f"(accum[0][1]), "f"(accum[0][2]), "f"(accum[0][3]),
+                       "f"(accum[1][0]), "f"(accum[1][1]), "f"(accum[1][2]), "f"(accum[1][3]));
+    }
+    // store grad_S
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 4; ++j) {
+            int gRow = tileM + (tid / 16) * 8 + i;
+            int gCol = tileN + (tid & 15) * 4 + j;
+            if (gRow < N && gCol < N)
+                tmem_o[gRow * N_TILE + gCol] = accum[i][j];
+        }
+    __syncthreads();
+
+    // ===== 阶段 5：softmax 反向 =====
+    for (int row = tid; row < M_TILE; row += blockDim.x) {
+        float sum = 0.0f;
+        for (int col = 0; col < N_TILE; col += 4) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+                sum += tmem_o[gRow * N_TILE + gCol] * tmem_o[gRow * N_TILE + gCol];
+        }
+        for (int col = 0; col < N_TILE; col += 4) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+                tmem_o[gRow * N_TILE + gCol] = tmem_o[gRow * N_TILE + gCol] * (tmem_o[gRow * N_TILE + gCol] - sum);
+        }
+    }
+
+    // ===== 阶段 6：dQ = grad_S @ K =====
+    for (int k0 = 0; k0 < D; k0 += K_TILE) {
+        if (tid == 0) {
+            __cudaptx_tma_load_bulk_tensor(tmem_kv + M_TILE * K_TILE, k_tma_map, tileN, k0,
+                                           N_TILE * K_TILE * sizeof(fp8_t));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        asm volatile("tcgen05.mma.sp.sync.aligned.m256n128k32.row.col.f32.fp8.fp8.fp32 "
+                     "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+                     "[%8], [%9], [%10], "
+                     "{%11,%12,%13,%14,%15,%16,%17,%18};\n"
+                     : "+f"(accum[0][0]), "+f"(accum[0][1]), "+f"(accum[0][2]), "+f"(accum[0][3]),
+                       "+f"(accum[1][0]), "+f"(accum[1][1]), "+f"(accum[1][2]), "+f"(accum[1][3])
+                     : "l"(tmem_o),                                    // grad_S
+                       "l"(tmem_kv + M_TILE * K_TILE),                 // K
+                       "l"(nullptr),
+                       "f"(accum[0][0]), "f"(accum[0][1]), "f"(accum[0][2]), "f"(accum[0][3]),
+                       "f"(accum[1][0]), "f"(accum[1][1]), "f"(accum[1][2]), "f"(accum[1][3]));
+    }
+    // store dQ
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 4; ++j) {
+            int gRow = tileM + (tid / 16) * 8 + i;
+            int gCol = tileN + (tid & 15) * 4 + j;
+            if (gRow < N && gCol < D)
+                dQ[gRow * D + gCol] = accum[i][j];
+        }
+    __syncthreads();
+
+    // ===== 阶段 7：dK = grad_S^T @ Q =====
+    for (int k0 = 0; k0 < D; k0 += K_TILE) {
+        if (tid == 0) {
+            __cudaptx_tma_load_bulk_tensor(tmem_kv, q_tma_map, tileM, k0,
+                                           M_TILE * K_TILE * sizeof(fp8_t));
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        asm volatile("tcgen05.mma.sp.sync.aligned.m256n128k32.row.col.f32.fp8.fp8.fp32 "
+                     "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+                     "[%8], [%9], [%10], "
+                     "{%11,%12,%13,%14,%15,%16,%17,%18};\n"
+                     : "+f"(accum[0][0]), "+f"(accum[0][1]), "+f"(accum[0][2]), "+f"(accum[0][3]),
+                       "+f"(accum[1][0]), "+f"(accum[1][1]), "+f"(accum[1][2]), "+f"(accum[1][3])
+                     : "l"(tmem_o),                                    // grad_S^T
+                       "l"(tmem_kv),                                   // Q
+                       "l"(nullptr),
+                       "f"(accum[0][0]), "f"(accum[0][1]), "f"(accum[0][2]), "f"(accum[0][3]),
+                       "f"(accum[1][0]), "f"(accum[1][1]), "f"(accum[1][2]), "f"(accum[1][3]));
+    }
+    // store dK
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 4; ++j) {
+            int gRow = tileN + (tid / 16) * 8 + i;
+            int gCol = tileM + (tid & 15) * 4 + j;
+            if (gRow < N && gCol < D)
+                dK[gRow * D + gCol] = accum[i][j];
+        }
+}
+
+// -------------- host wrapper --------------
+void flash_attn_v2_blackwell_tcgen05_backward(const fp8_t* q, const fp8_t* k, const fp8_t* v,
+                                              const float* out, const float* dout,
+                                              int B, int H, int N, int D)
+{
+    dim3 block(WARPGROUP_SIZE, 1, 1);
+    dim3 grid(1, (N + M_TILE - 1) / M_TILE, (N + N_TILE - 1) / N_TILE);
+    size_t tmemBytes = (M_TILE * N_TILE * sizeof(float) +
+                        (M_TILE + N_TILE + N_TILE) * K_TILE * sizeof(fp8_t));
+    // 分配输出
+    size_t len = B * H * N * D;
+    float *dQ, *dK, *dV;
+    cudaMalloc(&dQ, len * sizeof(float));
+    cudaMalloc(&dK, len * sizeof(float));
+    cudaMalloc(&dV, len * sizeof(float));
+
+    for (int bh = 0; bh < B * H; ++bh)
+        flash_v2_blackwell_tcgen05_backward_kernel<<<grid, block, tmemBytes>>>(
+            q + bh * N * D, k + bh * N * D, v + bh * N * D,
+            out + bh * N * D, dout + bh * N * D,
+            dQ + bh * N * D, dK + bh * N * D, dV + bh * N * D,
+            N, D);
+    cudaDeviceSynchronize();
+    return {dQ, dK, dV};
+}
