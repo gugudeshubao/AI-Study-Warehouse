@@ -40,3 +40,22 @@ FlashAttnGrad flash_attn_v2_backward(const float* q, const float* k, const float
                                      const float* out, const float* dout,
                                      int B, int H, int N, int D,
                                      Arch arch);
+
+
+
+//                                      // V3 前向
+// void flash_attn_v3_fwd(const float* q, const float* k, const float* v,
+//                        float* out,
+//                        int B, int H, int N, int D,
+//                        Arch arch);
+
+// // V3 反向
+// struct FlashAttnGrad {
+//     float* dQ;
+//     float* dK;
+//     float* dV;
+// };
+// FlashAttnGrad flash_attn_v3_backward(const float* q, const float* k, const float* v,
+//                                      const float* out, const float* dout,
+//                                      int B, int H, int N, int D,
+//                                      Arch arch);

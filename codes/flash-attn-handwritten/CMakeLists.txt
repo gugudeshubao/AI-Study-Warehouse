@@ -20,6 +20,11 @@ add_library(flash_attn STATIC
     # src/ampere/flash_attn_v2_ampere_mma.cu
     # src/hopper/flash_attn_v2_hopper_wgmma.cu
     # src/blackwell/flash_attn_v2_blackwell_tcgen05.cu
+
+    # src/cpu/flash_attn_v3_cpu.cpp
+    # src/cpu/flash_attn_v3_cpu_backward.cpp
+    # src/cuda/flash_attn_v3_cuda.cu
+    # src/cuda/flash_attn_v3_cuda_backward.cu
     
 )
 target_include_directories(flash_attn
