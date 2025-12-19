@@ -1,0 +1,17 @@
+# 数据与模型
+*.csv
+*.jsonl
+*.pkl
+*.h5
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# 实验临时文件
+experiments/*/runs/
+experiments/*/wandb/
+.ipynb_checkpoints/
+codes/*/build/
+codes/*/release/
+__pycache__/
