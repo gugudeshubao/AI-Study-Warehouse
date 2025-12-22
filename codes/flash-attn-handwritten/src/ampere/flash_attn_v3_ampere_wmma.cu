@@ -257,7 +257,7 @@ __global__ void flash_v3_ampere_wmma_backward_kernel(
     }
 }
 
-FlashAttnGrad flash_attn_v3_阿门票哦热wmma_backward(const float* q, const float* k, const float* v,
+FlashAttnGrad flash_attn_v3_ampere_wmma_backward(const float* q, const float* k, const float* v,
                                           const float* out, const float* dout,
                                           int B, int H, int N, int D)
 {
