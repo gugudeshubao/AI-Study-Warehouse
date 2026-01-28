@@ -3,7 +3,7 @@ project(flash_attn_cpp LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 70)   # Ampere 起步，够用
+set(CMAKE_CUDA_ARCHITECTURES 86)   # Ampere 起步，够用
 
 # ---- 找 CUDA / cuBLAS（后续用） ----
 find_package(CUDAToolkit REQUIRED)
@@ -17,7 +17,7 @@ add_library(flash_attn STATIC
     src/cuda/flash_attn_v2_cuda.cu
     src/baseline/flash_attn_v2_baseline.cu
     src/ampere/flash_attn_v2_ampere_wmma.cu
-    # src/ampere/flash_attn_v2_ampere_mma.cu
+    src/ampere/flash_attn_v2_ampere_mma.cu
     # src/hopper/flash_attn_v2_hopper_wgmma.cu
     # src/blackwell/flash_attn_v2_blackwell_tcgen05.cu
 
@@ -57,3 +57,16 @@ target_include_directories(test_correctness
 #         ${CMAKE_SOURCE_DIR}/src
 #         ${CUBLAS_TEMP_ROOT_PATH}
 # )
+
+
+# 调试程序
+add_executable(test_block_index tests/test_block_index.cu)
+target_link_libraries(test_block_index PRIVATE CUDA::cudart)
+
+target_include_directories(test_block_index
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src
+        ${CUBLAS_TEMP_ROOT_PATH}
+)

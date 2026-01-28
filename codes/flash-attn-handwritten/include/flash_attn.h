@@ -1,6 +1,6 @@
 #pragma once
 #include <cstddef>
-
+#include "common.h"
 enum class Arch
 {
     V2_CPU = 0,

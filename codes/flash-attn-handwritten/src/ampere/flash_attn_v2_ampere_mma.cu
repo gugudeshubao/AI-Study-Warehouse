@@ -2,11 +2,15 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <cuda/barrier>
-// #include <cuda_pipeline.h>
+#include <cuda_pipeline.h>
 namespace ampere_mma 
 {
 using barrier = cuda::barrier<cuda::thread_scope_block>;
-
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#define CP_ASYNC_WAIT_GROUP(n)  __pipeline_wait_prior(n)
+#else
+#define CP_ASYNC_WAIT_GROUP(n)  __syncthreads()
+#endif
 constexpr int MMA_M = 16;
 constexpr int MMA_N = 8;
 constexpr int MMA_K = 8;
@@ -55,13 +59,13 @@ __global__ void flash_v2_ampere_mma_kernel(
     // 1) cp.async 加载 Q tile
     for (int i = 0; i < D; i += 8)
         load_q_mma(q + tileM * D, sq + i, N, 0, D);
-    cp_async_wait_group<0>();
+    CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
     // 2) 加载 K tile
     for (int i = 0; i < D; i += 8)
         load_k_mma(k + tileN * D, sk + i, N, 0, D);
-    cp_async_wait_group<0>();
+    CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
     // 3) 使用 ldmatrix 载入寄存器 + mma
@@ -104,7 +108,7 @@ __global__ void flash_v2_ampere_mma_kernel(
     // 5) 加载 V tile
     for (int i = 0; i < D; i += 8)
         load_k_mma(v + tileN * D, sv + i, N, 0, D);   // 复用 load_k_mma
-    cp_async_wait_group<0>();
+    CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
     // 6) O = S V  再次 mma
@@ -133,8 +137,8 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
     float* dQ, float* dK, float* dV,
     int N, int D)
 {
-    extern __shared__ char smem[];
-    float* s  = reinterpret_cast<float*>(smem);
+    extern __shared__ char bwd_smem[];
+    float* s  = reinterpret_cast<float*>(bwd_smem);
     float* p  = s  + N * N;
     float* gs = p  + N * N;
     half* hq  = reinterpret_cast<half*>(gs + N * N);
@@ -220,6 +224,7 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
         __pipeline_wait_prior(0);
         __syncthreads();
 
+        uint32_t a[2], b[1];
         float c[4] = {};
         for (int k0 = 0; k0 < N; k0 += MMA_K) {
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
@@ -246,6 +251,7 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
         __pipeline_wait_prior(0);
         __syncthreads();
 
+        uint32_t a[2], b[1];
         float c[4] = {};
         for (int k0 = 0; k0 < D; k0 += MMA_K) {
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
@@ -283,6 +289,7 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
         __pipeline_wait_prior(0);
         __syncthreads();
 
+        uint32_t a[2], b[1];
         float c[4] = {};
         for (int k0 = 0; k0 < D; k0 += MMA_K) {
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
@@ -309,6 +316,7 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
         __pipeline_wait_prior(0);
         __syncthreads();
 
+        uint32_t a[2], b[1];
         float c[4] = {};
         for (int k0 = 0; k0 < D; k0 += MMA_K) {
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
