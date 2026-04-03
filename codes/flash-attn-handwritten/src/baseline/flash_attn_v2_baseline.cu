@@ -12,13 +12,11 @@ static cublasHandle_t get_handle()
 }
 
 // -device 版 row-wise softmax，极简 inline
-static __global__ void softmax_inplace_dev(float* s, int BH, int N)
+static __global__ void softmax_inplace_dev(float* s, int total_rows, int N)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= BH * N) return;
-    int row = idx / N;
-    int i   = idx % N;
-    float* rowPtr = s + row * N;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= total_rows) return;
+    float* rowPtr = s + static_cast<size_t>(row) * N;
 
     // max
     float max_val = -1e38f;
@@ -58,9 +56,10 @@ void flash_attn_v2_cublas_fwd(const float* q, const float* k, const float* v,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     // 2) row-wise softmax
+    int total_rows = B * H * N;
     dim3 block(128);
-    dim3 grid((B * H * N + block.x - 1) / block.x);
-    softmax_inplace_dev<<<grid, block>>>(s, B * H, N);
+    dim3 grid((total_rows + block.x - 1) / block.x);
+    softmax_inplace_dev<<<grid, block>>>(s, total_rows, N);
     cudaDeviceSynchronize();
 
     // 3) O = S V
@@ -89,24 +88,21 @@ static cublasHandle_t get_cublas_handle() {
 
 // 设备端行方向 softmax 反向
 __global__ void softmax_backward_row_device(float* grad, const float* out, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
     extern __shared__ float shared[];
     float* s_sum = shared;
-    float sum = 0.0f;
+    float local_sum = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
-        sum += grad[i] * out[i];
-    s_sum[threadIdx.x] = sum;
+        local_sum += grad[i] * out[i];
+    s_sum[threadIdx.x] = local_sum;
     __syncthreads();
     // 归约求和
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) s_sum[threadIdx.x] += s_sum[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) s_sum[0] = sum;
-    __syncthreads();
-    sum = s_sum[0];
-    grad[idx] = out[idx] * (grad[idx] - sum);
+    float sum = s_sum[0];
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        grad[i] = out[i] * (grad[i] - sum);
 }
 
 FlashAttnGrad cublas_flash_v2_backward(const float* q, const float* k, const float* v,
@@ -115,21 +111,23 @@ FlashAttnGrad cublas_flash_v2_backward(const float* q, const float* k, const flo
 {
     size_t len = B * H * N * D;
     float *dQ, *dK, *dV;
-    cudaMalloc(&dQ, len * sizeof(float));
-    cudaMalloc(&dK, len * sizeof(float));
-    cudaMalloc(&dV, len * sizeof(float));
-    cudaMemset(dQ, 0, len * sizeof(float));
-    cudaMemset(dK, 0, len * sizeof(float));
-    cudaMemset(dV, 0, len * sizeof(float));
+    CHECK_CUDA(cudaMalloc(&dQ, len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dK, len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dV, len * sizeof(float)));
+    CHECK_CUDA(cudaMemset(dQ, 0, len * sizeof(float)));
+    CHECK_CUDA(cudaMemset(dK, 0, len * sizeof(float)));
+    CHECK_CUDA(cudaMemset(dV, 0, len * sizeof(float)));
 
     cublasHandle_t handle = get_cublas_handle();
     const float alpha = 1.0f, beta = 0.0f;
+    constexpr auto compute_type = CUBLAS_COMPUTE_32F;
+    constexpr auto gemm_algo = CUBLAS_GEMM_DEFAULT;
 
     // 临时设备缓冲区
-    float *s, *p, *grad_s;
-    cudaMalloc(&s, B * H * N * N * sizeof(float));
-    cudaMalloc(&p, B * H * N * N * sizeof(float));
-    cudaMalloc(&grad_s, B * H * N * N * sizeof(float));
+    float *s, *grad_s;
+    CHECK_CUDA(cudaMalloc(&s, B * H * N * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&grad_s, B * H * N * N * sizeof(float)));
+    float *p = s;
 
     // ===== 1) 前向 S = Q@K^T =====
     cublasGemmStridedBatchedEx(handle,
@@ -141,65 +139,52 @@ FlashAttnGrad cublas_flash_v2_backward(const float* q, const float* k, const flo
         &beta,
         s, CUDA_R_32F, N, N * N,
         B * H,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        compute_type,
+        gemm_algo);
 
     // ===== 2) P = softmax(S) =====
-    dim3 block(128);
-    for (int bh = 0; bh < B * H; ++bh) {
-        for (int i = 0; i < N; ++i) {
-            // 行 max
-            float maxVal = -1e38f;
-            for (int j = 0; j < N; ++j)
-                maxVal = fmaxf(maxVal, s[bh * N * N + i * N + j]);
-            // 行 exp & sum
-            float sum = 0.0f;
-            for (int j = 0; j < N; ++j) {
-                float ev = expf(s[bh * N * N + i * N + j] - maxVal);
-                p[bh * N * N + i * N + j] = ev;
-                sum += ev;
-            }
-            // 行 normalize
-            for (int j = 0; j < N; ++j)
-                p[bh * N * N + i * N + j] /= sum;
-        }
-    }
+    int total_rows = B * H * N;
+    dim3 softmax_block(128);
+    dim3 softmax_grid((total_rows + softmax_block.x - 1) / softmax_block.x);
+    softmax_inplace_dev<<<softmax_grid, softmax_block>>>(p, total_rows, N);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     // ===== 3) dV = P^T @ dout =====
     cublasGemmStridedBatchedEx(handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
+        CUBLAS_OP_N, CUBLAS_OP_T,
         D, N, N,
         &alpha,
-        p, CUDA_R_32F, N, N * N,
         dout, CUDA_R_32F, D, N * D,
+        p, CUDA_R_32F, N, N * N,
         &beta,
         dV, CUDA_R_32F, D, N * D,
         B * H,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        compute_type,
+        gemm_algo);
 
     // ===== 4) grad_S = dout @ V^T =====
     cublasGemmStridedBatchedEx(handle,
-        CUBLAS_OP_N, CUBLAS_OP_T,
+        CUBLAS_OP_T, CUBLAS_OP_N,
         N, N, D,
         &alpha,
-        dout, CUDA_R_32F, D, N * D,
         v, CUDA_R_32F, D, N * D,
+        dout, CUDA_R_32F, D, N * D,
         &beta,
         grad_s, CUDA_R_32F, N, N * N,
         B * H,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        compute_type,
+        gemm_algo);
 
     // ===== 5) softmax 反向 =====
-    for (int bh = 0; bh < B * H; ++bh) {
-        for (int i = 0; i < N; ++i) {
-            float* row_grad = grad_s + bh * N * N + i * N;
-            const float* row_out = p + bh * N * N + i * N;
-            softmax_backward_row_device<<<(N + 127) / 128, 128, 128 * sizeof(float)>>>(row_grad, row_out, N);
-        }
+    constexpr int softmax_bwd_threads = 128;
+    for (int row = 0; row < total_rows; ++row) {
+        float* row_grad = grad_s + static_cast<size_t>(row) * N;
+        const float* row_out = p + static_cast<size_t>(row) * N;
+        softmax_backward_row_device<<<1, softmax_bwd_threads, softmax_bwd_threads * sizeof(float)>>>(row_grad, row_out, N);
     }
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     // ===== 6) dQ = grad_S @ K =====
     cublasGemmStridedBatchedEx(handle,
@@ -211,12 +196,12 @@ FlashAttnGrad cublas_flash_v2_backward(const float* q, const float* k, const flo
         &beta,
         dQ, CUDA_R_32F, D, N * D,
         B * H,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        compute_type,
+        gemm_algo);
 
     // ===== 7) dK = grad_S^T @ Q =====
     cublasGemmStridedBatchedEx(handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
+        CUBLAS_OP_N, CUBLAS_OP_T,
         D, N, N,
         &alpha,
         q, CUDA_R_32F, D, N * D,
@@ -224,9 +209,10 @@ FlashAttnGrad cublas_flash_v2_backward(const float* q, const float* k, const flo
         &beta,
         dK, CUDA_R_32F, D, N * D,
         B * H,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        compute_type,
+        gemm_algo);
 
-    cudaFree(s); cudaFree(p); cudaFree(grad_s);
+    cudaFree(s);
+    cudaFree(grad_s);
     return {dQ, dK, dV};
 }

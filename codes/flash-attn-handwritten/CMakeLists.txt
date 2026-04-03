@@ -14,18 +14,14 @@ set(CUBLAS_TEMP_ROOT_PATH /usr/local/cuda-11.4/targets/x86_64-linux/include)
 add_library(flash_attn STATIC
     src/flash_attn_dispatch.cpp
     src/cpu/flash_attn_v2_cpu.cpp
+    src/cpu/flash_attn_v3_cpu.cpp
     src/cuda/flash_attn_v2_cuda.cu
+    src/cuda/flash_attn_v3_cuda.cu
     src/baseline/flash_attn_v2_baseline.cu
     src/ampere/flash_attn_v2_ampere_wmma.cu
     src/ampere/flash_attn_v2_ampere_mma.cu
     # src/hopper/flash_attn_v2_hopper_wgmma.cu
     # src/blackwell/flash_attn_v2_blackwell_tcgen05.cu
-
-    # src/cpu/flash_attn_v3_cpu.cpp
-    # src/cpu/flash_attn_v3_cpu_backward.cpp
-    # src/cuda/flash_attn_v3_cuda.cu
-    # src/cuda/flash_attn_v3_cuda_backward.cu
-    
 )
 target_include_directories(flash_attn
     PRIVATE
@@ -46,17 +42,26 @@ target_include_directories(test_correctness
         ${CUBLAS_TEMP_ROOT_PATH}
 )
 
-# # ---- 可执行：性能测试 ----
-# add_executable(benchmark tests/benchmark.cpp)
-# target_link_libraries(benchmark PRIVATE flash_attn)
+add_executable(test_backward tests/test_backward.cpp)
+target_link_libraries(test_backward PRIVATE flash_attn GTest::gtest GTest::gtest_main)
+target_include_directories(test_backward
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CUBLAS_TEMP_ROOT_PATH}
+)
 
-# target_include_directories(benchmark
-#     PRIVATE
-#         ${CMAKE_SOURCE_DIR}/include
-#         ${CMAKE_SOURCE_DIR}/src
-#         ${CMAKE_SOURCE_DIR}/src
-#         ${CUBLAS_TEMP_ROOT_PATH}
-# )
+# ---- 可执行：性能测试 ----
+add_executable(benchmark tests/benchmark.cpp)
+target_link_libraries(benchmark PRIVATE flash_attn)
+
+target_include_directories(benchmark
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src
+        ${CUBLAS_TEMP_ROOT_PATH}
+)
 
 
 # 调试程序

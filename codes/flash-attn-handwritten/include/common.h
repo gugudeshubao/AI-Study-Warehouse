@@ -1,5 +1,7 @@
 #pragma once
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 
 #define CHECK_CUDA_LAST() do {                                          \
     cudaError_t err = cudaGetLastError();                               \

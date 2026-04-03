@@ -110,7 +110,6 @@ __global__ void flash_v2_ampere_wmma_backward_kernel(
     float* gs  = p   + N*N;
     half* hq   = reinterpret_cast<half*>(gs + N*N);
     half* hk   = hq  + WMMA_M * D;
-    half* hv   = hk  + WMMA_N * D;
 
     int tid = threadIdx.x;
     int bid = blockIdx.x;   // 1 block per (B,H)

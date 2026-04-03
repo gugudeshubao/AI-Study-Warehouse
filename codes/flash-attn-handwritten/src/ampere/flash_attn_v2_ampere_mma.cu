@@ -51,7 +51,6 @@ __global__ void flash_v2_ampere_mma_kernel(
     half* sv = smem + 16 * D + 8 * D;                   // V tile [8, D]
     float* ss = (float*)(smem + 16 * D + 8 * D + 8 * D); // S [16, 8]
 
-    int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int tileM = blockIdx.y * MMA_M;
     int tileN = blockIdx.z * MMA_N;
@@ -143,7 +142,6 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
     float* gs = p  + N * N;
     half* hq  = reinterpret_cast<half*>(gs + N * N);
     half* hk  = hq + MMA_M * D;
-    half* hv  = hk + MMA_N * D;
 
     int tid = threadIdx.x;
     int bid = blockIdx.x;
@@ -157,11 +155,9 @@ __global__ void flash_v2_ampere_mma_backward_kernel(
         for (int tileN = 0; tileN < N; tileN += MMA_N) {
             // load Q,K → shared (cp.async)
             for (int i = tid; i < MMA_M * D; i += blockDim.x) {
-                int row = i / D, col = i % D;
                 __pipeline_memcpy_async(&hq[i], &q[tileM * D + i], sizeof(half));
             }
             for (int i = tid; i < MMA_N * D; i += blockDim.x) {
-                int row = i / D, col = i % D;
                 __pipeline_memcpy_async(&hk[i], &k[tileN * D + i], sizeof(half));
             }
             __pipeline_commit();

@@ -13,8 +13,13 @@ __global__ void flash_attn_v2_cuda_kernel(
     float *s = smem;                // [N,N]  临时矩阵
     float *o = smem + N * N;        // [N,D]  结果
 
+    int bid = blockIdx.x;
     int tid = threadIdx.x;
     int stride = N * D;
+    q += bid * stride;
+    k += bid * stride;
+    v += bid * stride;
+    out += bid * stride;
 
     // 1) S = QK^T  每个线程负责一行
     for (int i = tid; i < N; i += blockDim.x)
@@ -79,36 +84,12 @@ void flash_attn_v2_cuda_fwd(const float *q, const float *k, const float *v,
     dim3 block(128, 1, 1);
     CHECK_CUDA_LAST();
     size_t shm_size = (N*D+N*N) * sizeof(float);
-    for (int bh = 0; bh < B * H; ++bh)
-    {
-
-        flash_attn_v2_cuda_kernel<<<grid, block,shm_size>>>(
-            q + bh * N * D, k + bh * N * D, v + bh * N * D, out + bh * N * D,
-            N, D);
-        CHECK_CUDA_LAST();
-    }
+    flash_attn_v2_cuda_kernel<<<grid, block,shm_size>>>(q, k, v, out, N, D);
     CHECK_CUDA(cudaGetLastError());
-            CHECK_CUDA_LAST();
     CHECK_CUDA(cudaDeviceSynchronize());
-            CHECK_CUDA_LAST();
 }
 
 constexpr int BLOCK = 128;
-
-// ----------- 设备端辅助 -----------
-__device__ void warp_softmax_backward(float *grad, const float *out, int n)
-{
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < n; j += blockDim.x)
-        sum += grad[j] * out[j];
-    __shared__ float shared_sum;
-    __syncthreads();
-    if (threadIdx.x == 0)
-        shared_sum = sum;
-    __syncthreads();
-    for (int j = threadIdx.x; j < n; j += blockDim.x)
-        grad[j] = out[j] * (grad[j] - shared_sum);
-}
 
 __global__ void flash_v2_cuda_backward_kernel(
     const float *q, const float *k, const float *v,
@@ -120,7 +101,6 @@ __global__ void flash_v2_cuda_backward_kernel(
     float *s = smem; // [N,N]
     float *p = s + N * N;
     float *gs = p + N * N;
-    float *tmp = gs + N * N; // 临时
 
     int tid = threadIdx.x;
     int bid = blockIdx.x; // 1 block per (B,H)
@@ -148,30 +128,23 @@ __global__ void flash_v2_cuda_backward_kernel(
     // 2) P = softmax(S)
     for (int i = 0; i < N; ++i)
     {
-        // max
-        float maxVal = -1e38f;
-        for (int j = tid; j < N; j += blockDim.x)
-            maxVal = fmaxf(maxVal, s[i * N + j]);
-        __shared__ float shared_max;
-        __syncthreads();
         if (tid == 0)
-            shared_max = maxVal;
-        __syncthreads();
-        // exp & sum
-        float sum = 0.0f;
-        for (int j = tid; j < N; j += blockDim.x)
         {
-            float ev = expf(s[i * N + j] - shared_max);
-            p[i * N + j] = ev;
-            sum += ev;
+            float maxVal = -1e38f;
+            for (int j = 0; j < N; ++j)
+                maxVal = fmaxf(maxVal, s[i * N + j]);
+
+            float sum = 0.0f;
+            for (int j = 0; j < N; ++j)
+            {
+                float ev = expf(s[i * N + j] - maxVal);
+                p[i * N + j] = ev;
+                sum += ev;
+            }
+
+            for (int j = 0; j < N; ++j)
+                p[i * N + j] /= sum;
         }
-        __syncthreads();
-        if (tid == 0)
-            shared_max = sum; // 复用变量
-        __syncthreads();
-        // normalize
-        for (int j = tid; j < N; j += blockDim.x)
-            p[i * N + j] /= shared_max;
         __syncthreads();
     }
 
@@ -200,8 +173,14 @@ __global__ void flash_v2_cuda_backward_kernel(
     // 5) softmax 反向
     for (int i = 0; i < N; ++i)
     {
-        if (tid < N)
-            warp_softmax_backward(&gs[i * N], &p[i * N], N);
+        if (tid == 0)
+        {
+            float sum = 0.0f;
+            for (int j = 0; j < N; ++j)
+                sum += gs[i * N + j] * p[i * N + j];
+            for (int j = 0; j < N; ++j)
+                gs[i * N + j] = p[i * N + j] * (gs[i * N + j] - sum);
+        }
         __syncthreads();
     }
 
@@ -233,15 +212,16 @@ FlashAttnGrad flash_attn_v2_cuda_backward(const float *q, const float *k, const 
 {
     size_t len = B * H * N * D;
     float *dQ, *dK, *dV;
-    cudaMalloc(&dQ, len * sizeof(float));
-    cudaMalloc(&dK, len * sizeof(float));
-    cudaMalloc(&dV, len * sizeof(float));
+    CHECK_CUDA(cudaMalloc(&dQ, len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dK, len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dV, len * sizeof(float)));
 
     size_t smem = (3 * N * N + N * D) * sizeof(float);
     dim3 grid(B * H, 1, 1);
     dim3 block(BLOCK, 1, 1);
     flash_v2_cuda_backward_kernel<<<grid, block, smem>>>(
         q, k, v, out, dout, dQ, dK, dV, N, D);
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
     return {dQ, dK, dV};
 }
