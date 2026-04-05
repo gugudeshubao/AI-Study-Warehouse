@@ -91,6 +91,8 @@ cmake --build build --target benchmark -j
   - 对比当前实现和 Tri Dao 官方 `flash-attn`
 - `scripts/modal_flash_attn_impl_bench.py`
   - 在 `A10G` 上对比当前仓库内部的 `V2_CUDA` / `V2_CUBLAS`
+- `scripts/modal_flash_attn_v3_bwd_bench.py`
+  - 在 `A10G` 上对比 `V2_CUBLAS backward` / `V3_CUDA backward`
 
 运行：
 
@@ -98,6 +100,7 @@ cmake --build build --target benchmark -j
 modal run scripts/modal_flash_attn_ampere.py
 modal run scripts/modal_flash_attn_vs_tridao.py
 modal run scripts/modal_flash_attn_impl_bench.py
+modal run scripts/modal_flash_attn_v3_bwd_bench.py
 ```
 
 ## 与 Tri Dao 官方实现的对比
@@ -178,7 +181,27 @@ modal run scripts/modal_flash_attn_impl_bench.py
 - 当前 `V3_CUDA` backward 已经接成了真正的 tiled CUDA kernel，并在 A10G 上通过了 correctness
 - 但它还不是高性能版 backward：
   - 当前目标是先闭合 `V3` 前后向链路
-  - 性能优化仍然主要集中在 forward 主线
+  - 性能优化仍然主要集中在 backward 主线
+
+当前 `V3_CUDA backward` 和 `V2_CUBLAS backward` 的 A10G benchmark：
+
+| Shape | `V2_CUBLAS bwd` ms | `V3_CUDA bwd` ms | 更快实现 |
+|---|---:|---:|---|
+| `B2 H16 N128 D64` | `12.086` | `1.671` | `V3_CUDA` |
+| `B2 H16 N256 D64` | `25.827` | `6.197` | `V3_CUDA` |
+| `B2 H16 N512 D64` | `66.959` | `24.993` | `V3_CUDA` |
+
+对应解读：
+
+- `V3_CUDA backward` 现在已经在当前测试区间内全面超过 `V2_CUBLAS backward`
+- 这次收益主要来自：
+  - 多行 block 并行
+  - tile 内 `dK / dV` 先在 shared memory 聚合，再一次性写回全局
+  - softmax backward 的整行统计与 tile 局部统计拆开
+- 如果继续优化，重点会是：
+  - 减少 backward 里的重复 QK / doutV 重算
+  - 进一步压缩全局写回次数
+  - 把 backward 的逐行三遍扫描继续合并
 - 如果继续推进 `V3`，下一步重点不再是“correctness”，而是：
   - 更粗粒度的 tile 并行
   - 更好的 Q/K/V shared memory 复用

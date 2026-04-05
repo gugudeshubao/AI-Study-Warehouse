@@ -63,6 +63,16 @@ target_include_directories(benchmark
         ${CUBLAS_TEMP_ROOT_PATH}
 )
 
+add_executable(benchmark_backward tests/benchmark_backward.cpp)
+target_link_libraries(benchmark_backward PRIVATE flash_attn)
+
+target_include_directories(benchmark_backward
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CUBLAS_TEMP_ROOT_PATH}
+)
+
 
 # 调试程序
 add_executable(test_block_index tests/test_block_index.cu)
