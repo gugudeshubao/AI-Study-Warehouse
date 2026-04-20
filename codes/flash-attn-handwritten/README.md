@@ -187,9 +187,9 @@ modal run scripts/modal_flash_attn_v3_bwd_bench.py
 
 | Shape | `V2_CUBLAS bwd` ms | `V3_CUDA bwd` ms | 更快实现 |
 |---|---:|---:|---|
-| `B2 H16 N128 D64` | `12.086` | `1.671` | `V3_CUDA` |
-| `B2 H16 N256 D64` | `25.827` | `6.197` | `V3_CUDA` |
-| `B2 H16 N512 D64` | `66.959` | `24.993` | `V3_CUDA` |
+| `B2 H16 N128 D64` | `14.134` | `1.125` | `V3_CUDA` |
+| `B2 H16 N256 D64` | `26.198` | `3.856` | `V3_CUDA` |
+| `B2 H16 N512 D64` | `67.550` | `13.588` | `V3_CUDA` |
 
 对应解读：
 
@@ -198,6 +198,14 @@ modal run scripts/modal_flash_attn_v3_bwd_bench.py
   - 多行 block 并行
   - tile 内 `dK / dV` 先在 shared memory 聚合，再一次性写回全局
   - softmax backward 的整行统计与 tile 局部统计拆开
+- 和 Tri Dao backward 的最新 A10G 对比：
+
+| Shape | `V3_CUDA bwd` ms | `Tri Dao bwd` ms | Tri Dao Faster |
+|---|---:|---:|---:|
+| `B2 H16 N128 D64` | `1.129` | `0.174` | `6.50x` |
+| `B2 H16 N256 D64` | `3.803` | `0.170` | `22.36x` |
+| `B2 H16 N512 D64` | `12.670` | `0.178` | `71.21x` |
+
 - 如果继续优化，重点会是：
   - 减少 backward 里的重复 QK / doutV 重算
   - 进一步压缩全局写回次数
@@ -215,7 +223,7 @@ modal run scripts/modal_flash_attn_v3_bwd_bench.py
 - 性能主线还远不是官方 FlashAttention：
   - 当前最快、最稳定的前向路径已经切到 `V3_CUDA`
   - `V3_CUDA` 已经是 streaming / online softmax 路线
-  - `V3_CUDA` backward 已可用，但还没有做性能优化
+  - `V3_CUDA` backward 已可用，而且已经开始做性能优化
   - 与官方 `flash-attn` 的差距已经从之前的 `40x ~ 100x` 缩到当前的 `24x ~ 32x`
 
 ## 下一步

@@ -7,6 +7,7 @@
 namespace {
 
 constexpr int TILE_N = 64;
+constexpr int BWD_TILE_N = 32;
 constexpr int WARPS_PER_BLOCK = 8;
 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
 constexpr int SUBWARP_SIZE = 16;
@@ -196,16 +197,16 @@ __global__ void flash_v3_cuda_backward_kernel(
     (void)out;
 
     extern __shared__ float smem[];
-    float* k_shared = smem;                                             // [TILE_N, D]
-    float* v_shared = k_shared + TILE_N * D;                            // [TILE_N, D]
-    float* probs = v_shared + TILE_N * D;                               // [BWD_WARPS_PER_BLOCK, TILE_N]
-    float* gradp = probs + BWD_WARPS_PER_BLOCK * TILE_N;                // [BWD_WARPS_PER_BLOCK, TILE_N]
-    float* gs = gradp + BWD_WARPS_PER_BLOCK * TILE_N;                   // [BWD_WARPS_PER_BLOCK, TILE_N]
-    float* row_max_buf = gs + BWD_WARPS_PER_BLOCK * TILE_N;             // [BWD_WARPS_PER_BLOCK]
+    float* k_shared = smem;                                             // [BWD_TILE_N, D]
+    float* v_shared = k_shared + BWD_TILE_N * D;                        // [BWD_TILE_N, D]
+    float* probs = v_shared + BWD_TILE_N * D;                           // [BWD_WARPS_PER_BLOCK, BWD_TILE_N]
+    float* gradp = probs + BWD_WARPS_PER_BLOCK * BWD_TILE_N;            // [BWD_WARPS_PER_BLOCK, BWD_TILE_N]
+    float* gs = gradp + BWD_WARPS_PER_BLOCK * BWD_TILE_N;               // [BWD_WARPS_PER_BLOCK, BWD_TILE_N]
+    float* row_max_buf = gs + BWD_WARPS_PER_BLOCK * BWD_TILE_N;         // [BWD_WARPS_PER_BLOCK]
     float* row_sum_buf = row_max_buf + BWD_WARPS_PER_BLOCK;             // [BWD_WARPS_PER_BLOCK]
     float* row_softmax_sum_buf = row_sum_buf + BWD_WARPS_PER_BLOCK;     // [BWD_WARPS_PER_BLOCK]
-    float* dV_tile = row_softmax_sum_buf + BWD_WARPS_PER_BLOCK;         // [TILE_N, D]
-    float* dK_tile = dV_tile + TILE_N * D;                              // [TILE_N, D]
+    float* dV_tile = row_softmax_sum_buf + BWD_WARPS_PER_BLOCK;         // [BWD_TILE_N, D]
+    float* dK_tile = dV_tile + BWD_TILE_N * D;                          // [BWD_TILE_N, D]
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -246,8 +247,8 @@ __global__ void flash_v3_cuda_backward_kernel(
     float row_max = -INFINITY;
     float row_sum = 0.0f;
 
-    for (int tile = 0; tile < N; tile += TILE_N) {
-        const int actual = min(TILE_N, N - tile);
+    for (int tile = 0; tile < N; tile += BWD_TILE_N) {
+        const int actual = min(BWD_TILE_N, N - tile);
 
         if ((D & 3) == 0) {
             const int D4 = D / 4;
@@ -272,23 +273,23 @@ __global__ void flash_v3_cuda_backward_kernel(
                 partial += q_values[t] * k_shared[jj * D + d_indices[t]];
             const float score = warp_reduce_sum(partial);
             if (lane == 0)
-                probs[warp * TILE_N + jj] = score;
+                probs[warp * BWD_TILE_N + jj] = score;
         }
         __syncthreads();
 
         float tile_max = -INFINITY;
         for (int jj = lane; jj < actual; jj += 32)
-            tile_max = fmaxf(tile_max, probs[warp * TILE_N + jj]);
+            tile_max = fmaxf(tile_max, probs[warp * BWD_TILE_N + jj]);
         tile_max = warp_reduce_sum(tile_max); // will be corrected below
         if (lane == 0) {
             float real_tile_max = -INFINITY;
             for (int jj = 0; jj < actual; ++jj)
-                real_tile_max = fmaxf(real_tile_max, probs[warp * TILE_N + jj]);
+                real_tile_max = fmaxf(real_tile_max, probs[warp * BWD_TILE_N + jj]);
             const float new_max = fmaxf(row_max, real_tile_max);
             const float scale = row_sum == 0.0f ? 0.0f : expf(row_max - new_max);
             float new_sum = row_sum * scale;
             for (int jj = 0; jj < actual; ++jj)
-                new_sum += expf(probs[warp * TILE_N + jj] - new_max);
+                new_sum += expf(probs[warp * BWD_TILE_N + jj] - new_max);
             row_max = new_max;
             row_sum = new_sum;
             row_max_buf[warp] = row_max;
@@ -300,12 +301,12 @@ __global__ void flash_v3_cuda_backward_kernel(
     }
 
     float row_softmax_sum = 0.0f;
-    for (int tile = 0; tile < N; tile += TILE_N) {
-        const int actual = min(TILE_N, N - tile);
+    for (int tile = 0; tile < N; tile += BWD_TILE_N) {
+        const int actual = min(BWD_TILE_N, N - tile);
 
         if ((D & 3) == 0) {
             const int D4 = D / 4;
-            for (int idx4 = lane; idx4 < actual * D4; idx4 += 32) {
+            for (int idx4 = tid; idx4 < actual * D4; idx4 += BWD_THREADS) {
                 const int jj = idx4 / D4;
                 const int d4 = idx4 % D4;
                 reinterpret_cast<float4*>(k_shared + jj * D)[d4] =
@@ -314,7 +315,7 @@ __global__ void flash_v3_cuda_backward_kernel(
                     reinterpret_cast<const float4*>(v + (tile + jj) * D)[d4];
             }
         } else {
-            for (int idx = lane; idx < actual * D; idx += 32) {
+            for (int idx = tid; idx < actual * D; idx += BWD_THREADS) {
                 const int jj = idx / D;
                 const int d = idx % D;
                 k_shared[idx] = k[(tile + jj) * D + d];
@@ -333,7 +334,7 @@ __global__ void flash_v3_cuda_backward_kernel(
                 partial += q_values[t] * k_shared[jj * D + d_indices[t]];
             const float score = warp_reduce_sum(partial);
             if (lane == 0)
-                probs[warp * TILE_N + jj] = expf(score - row_max) / row_sum;
+                probs[warp * BWD_TILE_N + jj] = expf(score - row_max) / row_sum;
         }
         __syncthreads();
 
@@ -343,21 +344,20 @@ __global__ void flash_v3_cuda_backward_kernel(
                 partial += dout_values[t] * v_shared[jj * D + d_indices[t]];
             const float g = warp_reduce_sum(partial);
             if (lane == 0)
-                gradp[warp * TILE_N + jj] = g;
+                gradp[warp * BWD_TILE_N + jj] = g;
         }
         __syncthreads();
 
         for (int t = 0; t < d_count; ++t) {
             const int d = d_indices[t];
-            for (int jj = 0; jj < actual; ++jj) {
-                atomicAdd(&dV_tile[jj * D + d], probs[warp * TILE_N + jj] * dout_values[t]);
-            }
+            for (int jj = 0; jj < actual; ++jj)
+                atomicAdd(&dV_tile[jj * D + d], probs[warp * BWD_TILE_N + jj] * dout_values[t]);
         }
         __syncthreads();
 
         if (lane == 0) {
             for (int jj = 0; jj < actual; ++jj)
-                row_softmax_sum += gradp[warp * TILE_N + jj] * probs[warp * TILE_N + jj];
+                row_softmax_sum += gradp[warp * BWD_TILE_N + jj] * probs[warp * BWD_TILE_N + jj];
             row_softmax_sum_buf[warp] = row_softmax_sum;
         }
         __syncthreads();
@@ -369,12 +369,12 @@ __global__ void flash_v3_cuda_backward_kernel(
 
     row_softmax_sum = row_softmax_sum_buf[warp];
 
-    for (int tile = 0; tile < N; tile += TILE_N) {
-        const int actual = min(TILE_N, N - tile);
+    for (int tile = 0; tile < N; tile += BWD_TILE_N) {
+        const int actual = min(BWD_TILE_N, N - tile);
 
         if ((D & 3) == 0) {
             const int D4 = D / 4;
-            for (int idx4 = lane; idx4 < actual * D4; idx4 += 32) {
+            for (int idx4 = tid; idx4 < actual * D4; idx4 += BWD_THREADS) {
                 const int jj = idx4 / D4;
                 const int d4 = idx4 % D4;
                 reinterpret_cast<float4*>(k_shared + jj * D)[d4] =
@@ -383,7 +383,7 @@ __global__ void flash_v3_cuda_backward_kernel(
                     reinterpret_cast<const float4*>(v + (tile + jj) * D)[d4];
             }
         } else {
-            for (int idx = lane; idx < actual * D; idx += 32) {
+            for (int idx = tid; idx < actual * D; idx += BWD_THREADS) {
                 const int jj = idx / D;
                 const int d = idx % D;
                 k_shared[idx] = k[(tile + jj) * D + d];
@@ -402,7 +402,7 @@ __global__ void flash_v3_cuda_backward_kernel(
                 partial += q_values[t] * k_shared[jj * D + d_indices[t]];
             const float score = warp_reduce_sum(partial);
             if (lane == 0)
-                probs[warp * TILE_N + jj] = expf(score - row_max) / row_sum;
+                probs[warp * BWD_TILE_N + jj] = expf(score - row_max) / row_sum;
         }
         __syncthreads();
 
@@ -412,21 +412,21 @@ __global__ void flash_v3_cuda_backward_kernel(
                 partial += dout_values[t] * v_shared[jj * D + d_indices[t]];
             const float g = warp_reduce_sum(partial);
             if (lane == 0)
-                gradp[warp * TILE_N + jj] = g;
+                gradp[warp * BWD_TILE_N + jj] = g;
         }
         __syncthreads();
 
         if (lane == 0) {
             for (int jj = 0; jj < actual; ++jj)
-                gs[warp * TILE_N + jj] = probs[warp * TILE_N + jj] * (gradp[warp * TILE_N + jj] - row_softmax_sum);
+                gs[warp * BWD_TILE_N + jj] = probs[warp * BWD_TILE_N + jj] * (gradp[warp * BWD_TILE_N + jj] - row_softmax_sum);
         }
         __syncthreads();
 
         for (int t = 0; t < d_count; ++t) {
             const int d = d_indices[t];
             for (int jj = 0; jj < actual; ++jj) {
-                atomicAdd(&dK_tile[jj * D + d], gs[warp * TILE_N + jj] * q_values[t]);
-                dq_values[t] += gs[warp * TILE_N + jj] * k_shared[jj * D + d];
+                atomicAdd(&dK_tile[jj * D + d], gs[warp * BWD_TILE_N + jj] * q_values[t]);
+                dq_values[t] += gs[warp * BWD_TILE_N + jj] * k_shared[jj * D + d];
             }
         }
         __syncthreads();
@@ -456,8 +456,8 @@ FlashAttnGrad flash_attn_v3_cuda_backward(const float* q, const float* k, const 
     const dim3 grid(B * H, (N + BWD_WARPS_PER_BLOCK - 1) / BWD_WARPS_PER_BLOCK, 1);
     const dim3 block(BWD_THREADS, 1, 1);
     const size_t smem =
-        (2 * TILE_N * D + 3 * BWD_WARPS_PER_BLOCK * TILE_N +
-         3 * BWD_WARPS_PER_BLOCK + 2 * TILE_N * D) * sizeof(float);
+        (2 * BWD_TILE_N * D + 3 * BWD_WARPS_PER_BLOCK * BWD_TILE_N +
+         3 * BWD_WARPS_PER_BLOCK + 2 * BWD_TILE_N * D) * sizeof(float);
 
     int max_optin_smem = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
